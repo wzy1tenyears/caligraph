@@ -1,76 +1,280 @@
-import io
+import json
 import os.path
 import random
+import re
 import urllib.parse
 
-import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
-# 引入本地缓存
 from strokes_code import STOKES_CODE
 
 
-def char_frames(word, cache='./cache',vibe=True):
-    """
-    将一个汉字变成书写动画帧
-    """
-    word = hex((ord(word)))[2:]
-    word = urllib.parse.quote(word)
+PATH_TOKEN_RE = re.compile(r'[MLQCZ]|-?\d+(?:\.\d+)?')
+FONT_STYLES = ('standard', 'kaishu', 'bold', 'thin')
+SYSTEM_FONT_ALIASES = {
+    'simkai': 'simkai.ttf',
+    'kaiti': 'simkai.ttf',
+    'simhei': 'simhei.ttf',
+    'heiti': 'simhei.ttf',
+    'simsun': 'simsun.ttc',
+    'songti': 'simsun.ttc',
+    'msyh': 'msyh.ttc',
+    'yahei': 'msyh.ttc',
+}
+FONT_CHOICES = FONT_STYLES + tuple(SYSTEM_FONT_ALIASES)
+
+
+def _canvas_point(point, size):
+    x, y = point
+    return (round(x / 1024 * size), round((900 - y) / 1024 * size))
+
+
+def _sample_line(start, end, size, steps=8):
+    points = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        x = start[0] + (end[0] - start[0]) * t
+        y = start[1] + (end[1] - start[1]) * t
+        points.append(_canvas_point((x, y), size))
+    return points
+
+
+def _sample_quadratic(start, control, end, size, steps=24):
+    points = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        mt = 1 - t
+        x = mt * mt * start[0] + 2 * mt * t * control[0] + t * t * end[0]
+        y = mt * mt * start[1] + 2 * mt * t * control[1] + t * t * end[1]
+        points.append(_canvas_point((x, y), size))
+    return points
+
+
+def _sample_cubic(start, control1, control2, end, size, steps=32):
+    points = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        mt = 1 - t
+        x = (
+            mt * mt * mt * start[0]
+            + 3 * mt * mt * t * control1[0]
+            + 3 * mt * t * t * control2[0]
+            + t * t * t * end[0]
+        )
+        y = (
+            mt * mt * mt * start[1]
+            + 3 * mt * mt * t * control1[1]
+            + 3 * mt * t * t * control2[1]
+            + t * t * t * end[1]
+        )
+        points.append(_canvas_point((x, y), size))
+    return points
+
+
+def _path_to_polygons(path, size):
+    tokens = PATH_TOKEN_RE.findall(path)
+    polygons = []
+    points = []
+    command = None
+    current = None
+    start = None
+    i = 0
+
+    def read_point():
+        nonlocal i
+        point = (float(tokens[i]), float(tokens[i + 1]))
+        i += 2
+        return point
+
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            command = tokens[i]
+            i += 1
+
+        if command == 'M':
+            if len(points) >= 3:
+                polygons.append(points)
+            current = read_point()
+            start = current
+            points = [_canvas_point(current, size)]
+            command = 'L'
+        elif command == 'L':
+            end = read_point()
+            points.extend(_sample_line(current, end, size))
+            current = end
+        elif command == 'Q':
+            control = read_point()
+            end = read_point()
+            points.extend(_sample_quadratic(current, control, end, size))
+            current = end
+        elif command == 'C':
+            control1 = read_point()
+            control2 = read_point()
+            end = read_point()
+            points.extend(_sample_cubic(current, control1, control2, end, size))
+            current = end
+        elif command == 'Z':
+            if start:
+                points.extend(_sample_line(current, start, size))
+                current = start
+            if len(points) >= 3:
+                polygons.append(points)
+            points = []
+            command = None
+        else:
+            raise ValueError(f'unsupported SVG path command: {command}')
+
+    if len(points) >= 3:
+        polygons.append(points)
+    return polygons
+
+
+def _render_stroke(path, size=150):
+    render_scale = 2 if size <= 512 else 1
+    render_size = size * render_scale
+    image = Image.new('L', (render_size, render_size), 255)
+    draw = ImageDraw.Draw(image)
+    for polygon in _path_to_polygons(path, render_size):
+        draw.polygon(polygon, fill=0)
+    if render_scale > 1:
+        image = image.resize((size, size), Image.Resampling.LANCZOS)
+    return image
+
+
+def _apply_font_style(image, font):
+    size = image.size[0]
+
+    def odd_kernel(ratio, minimum=3):
+        value = max(minimum, int(round(size * ratio)))
+        return value if value % 2 == 1 else value + 1
+
+    if font == 'standard':
+        return image
+    if font == 'kaishu':
+        return image.transform(
+            image.size,
+            Image.Transform.AFFINE,
+            (1, -0.10, max(1, round(size * 8 / 150)), 0, 1, 0),
+            fillcolor=255,
+        )
+    if font == 'bold':
+        return image.filter(ImageFilter.MinFilter(odd_kernel(5 / 150)))
+    if font == 'thin':
+        return image.filter(ImageFilter.MaxFilter(odd_kernel(3 / 150)))
+    raise ValueError(f"unsupported font: {font}")
+
+
+def resolve_font(font):
+    if not font:
+        return 'standard'
+
+    font_key = font.lower()
+    if font_key in FONT_STYLES:
+        return font_key
+
+    font_path = os.path.expanduser(font)
+    if os.path.exists(font_path):
+        return font_path
+
+    alias = SYSTEM_FONT_ALIASES.get(font_key)
+    if alias:
+        windows_dir = os.environ.get('WINDIR', r'C:\Windows')
+        alias_path = os.path.join(windows_dir, 'Fonts', alias)
+        if os.path.exists(alias_path):
+            return alias_path
+
+    fonts_dir = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')
+    for extension in ('*.ttf', '*.ttc', '*.otf'):
+        pattern = re.compile(r'.*', re.IGNORECASE)
+        if not os.path.isdir(fonts_dir):
+            break
+        for filename in os.listdir(fonts_dir):
+            if not filename.lower().endswith(extension[1:]):
+                continue
+            stem = os.path.splitext(filename)[0].lower()
+            if stem == font_key:
+                return os.path.join(fonts_dir, filename)
+        if not pattern:
+            break
+
+    raise ValueError(
+        f"unsupported font: {font}. Use --list-fonts to see built-in names, "
+        "or pass a .ttf/.ttc/.otf file path."
+    )
+
+
+def _render_font_glyph(char, font_path, size=150):
+    image = Image.new('L', (size, size), 255)
+    draw = ImageDraw.Draw(image)
+    font_size = int(size * 0.86)
+
+    while font_size > 12:
+        font = ImageFont.truetype(font_path, font_size)
+        bbox = draw.textbbox((0, 0), char, font=font)
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        if width <= size * 0.90 and height <= size * 0.90:
+            break
+        font_size -= 2
+
+    x = (size - width) / 2 - bbox[0]
+    y = (size - height) / 2 - bbox[1]
+    draw.text((x, y), char, font=font, fill=0)
+    return image
+
+
+def _custom_font_stroke(char, font_path, stroke_path, size=150):
+    glyph = _render_font_glyph(char, font_path, size)
+    kernel = max(3, int(round(size * 11 / 150)))
+    if kernel % 2 == 0:
+        kernel += 1
+    stroke_region = _render_stroke(stroke_path, size).filter(ImageFilter.MinFilter(kernel))
+    mask = ImageChops.lighter(glyph, stroke_region)
+    if ImageChops.invert(mask).getbbox() is None:
+        return _render_stroke(stroke_path, size)
+    return mask
+
+
+def _load_hanziwu_data(char, cache):
+    code = hex(ord(char))[2:]
+    json_path = os.path.join(cache, f"{code}.json")
+    url = f"https://www.hanziwu.com/assets/bishun/json/{urllib.parse.quote(char)}.json"
+
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        return data
+
+
+def char_frames(word, cache='./cache', vibe=True, font='standard', size=150):
     if not os.path.exists(cache):
         os.makedirs(cache)
-    img_path = os.path.join(cache, f"{word}.png")
-    url = f"http://www.hanzi5.com/assets/bishun/stroke/{word}-fenbu.png"
-    # gif = f"http://www.hanzi5.com/assets/bishun/stroke/{word}-bishun.gif"
-    try:
-        img = Image.open(img_path)
-    except:
-        img = Image.open(io.BytesIO(requests.get(url).content))
-        img.save(img_path)
-    
-    img = img.convert('L')
-    w = 150
-    x = 0
-    y = 0
-    imgs = []
-    while True:
-        imglst = img.crop((x, y, x + w, y + w))
-        imgs.append(imglst)
-        x = x + w + 3
-        if x > img.width:
-            x = 0
-            y = y + w + 3
-        if y > img.height:
-            break
-    imgs.pop()
-    while np.all(np.array(imgs[-1]) == 255):
-        imgs.pop()
-    BLUE = 167
-    GRAY = 237
-    RED = 135
-    # BLACK = 48
-    # WHITE = 255
-    out = [Image.new('L',(w,w),255)]#
-    # base = Image.new('L',(w,w),255)
-    border = imgs[0].point(lambda x: x if x == BLUE else 255)
-    for index, i in enumerate(imgs):
-        im = out[-1].copy()
-        msk = i.point(lambda x: 0 if x == RED else 255)
+
+    data = _load_hanziwu_data(word, cache)
+    resolved_font = resolve_font(font)
+    out = [Image.new('L', (size, size), 255)]
+
+    for stroke_path in data.get('strokes', []):
+        if resolved_font in FONT_STYLES:
+            mask = _render_stroke(stroke_path, size)
+            mask = _apply_font_style(mask, resolved_font)
+        else:
+            mask = _custom_font_stroke(word, resolved_font, stroke_path, size)
         if vibe:
-            msk = msk.rotate(random.randint(-3,3),fillcolor=255,translate=(random.randint(-1,1),random.randint(-1,1)))
+            mask = mask.rotate(
+                random.randint(-3, 3),
+                fillcolor=255,
+                translate=(random.randint(-1, 1), random.randint(-1, 1)),
+            )
+        out.append(mask)
 
-        im.paste(msk,mask=msk.point(lambda x:255-x))
-        # im.paste(border,mask=border.point(lambda x: 0 if x==255 else 255))
-        # im.save(f'{index}.jpg')
-        out.append(msk)#x == BLUE or fixme
-
-    output_file = f"{word}.gif"
-    duration = 50  # 帧之间的延迟时间（以毫秒为单位）
-    loop = 0  # 动画循环次数（0表示无限循环）
-
-    # out[0] = imgs[0].point(lambda x: x if x == BLUE else 255)
-    # 使用第一个图像创建一个新的GIF对象，将其他图像追加为帧
-    # out[0].save(output_file, save_all=True, append_images=out[1:], duration=duration, loop=loop)
     return out
 
 

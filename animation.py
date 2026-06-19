@@ -62,7 +62,7 @@ def high_quality_mask(binary, epsilon=0.001, size=None):
     # if size:
     #     binary = cv2.resize(binary,size)
     contours, _ = cv2.findContours(
-        binary, cv2.RETR_EXTERNAL, cv2.cv2.CHAIN_APPROX_SIMPLE
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     logger.debug(len(contours))
@@ -79,12 +79,16 @@ def high_quality_mask(binary, epsilon=0.001, size=None):
 
     approx = cv2.approxPolyDP(longest_contour, 1, True)
     if size:
-        resized_approx = np.array(approx * size[0] / 150, np.int32)
+        src_h, src_w = binary.shape[:2]
+        target_w, target_h = size
+        scale = np.array([target_w / src_w, target_h / src_h], np.float32)
+        resized_approx = np.array(approx * scale, np.int32)
     else:
         resized_approx = approx
+        size = (binary.shape[1], binary.shape[0])
 
     # mask = np.zeros_like(binary, np.uint8)
-    mask = np.zeros(size, np.uint8)
+    mask = np.zeros((size[1], size[0]), np.uint8)
 
     cv2.fillPoly(mask, [resized_approx], 255)
     return mask
@@ -340,22 +344,24 @@ def nonlinear_sample_list(lst, num_samples):
     return [lst[i] for i in samples]
 
 
-def generate_frames(char, approx=False, speed=None, size=None):
+def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
     """生成帧"""
     if len(char) != 1:
         raise ValueError('only support single character')
     if not size:
         W, H = 150, 150
-        ratio = 1
     else:
         W, H = size
-        ratio = W / 150
-    bg = np.zeros((W, H, 3), np.uint8)
-    key_frame = np.zeros((W, H), np.uint8)
-    for stroke_image, stroke_code in zip(char_frames(char, vibe=False)[1:], char_strokes(char)):
+    target_size = (W, H)
+    bg = np.zeros((H, W, 3), np.uint8)
+    key_frame = np.zeros((H, W), np.uint8)
+    base_frames = char_frames(char, vibe=False, font=font, size=150)[1:]
+    target_frames = char_frames(char, vibe=False, font=font, size=W)[1:]
+    for stroke_image, target_stroke_image, stroke_code in zip(base_frames, target_frames, char_strokes(char)):
         msk = np.zeros((150, 150), np.uint8)
         mask = stroke_image.point(lambda x: 0 if x > 127 else 255)
         image = np.asarray(mask, np.uint8)
+        target_image = np.asarray(target_stroke_image.point(lambda x: 255 - x), np.uint8)
 
         path, contours = reconstruct_path(image)
 
@@ -402,16 +408,16 @@ def generate_frames(char, approx=False, speed=None, size=None):
         cv2.circle(bg, start_point, 5, (0, 255, 255))
         cv2.circle(bg, end_point, 5, (255, 255, 0))
 
-        image = high_quality_mask(image, 0.001, size)
+        reveal_image = target_image
         # corners = cv2.goodFeaturesToTrack(image, maxCorners=2, qualityLevel=0.5, minDistance=7)
 
         for i in range(len(curves)):
             cv2.line(bg, curves[i], closest_points[i], (255, 0, 0), 5)  # todo 通过i来控制采样速度
             cv2.circle(msk, centers[i], 1 + int(2.2 * rads[i]), 255, -1)
 
-            _mask = cv2.resize(msk, size)
+            _mask = cv2.resize(msk, target_size, interpolation=cv2.INTER_LINEAR)
 
-            fr = cv2.bitwise_and(image, _mask)
+            fr = cv2.bitwise_and(reveal_image, _mask)
             key_frame = cv2.bitwise_or(key_frame, fr)
 
             if speed:
@@ -435,7 +441,7 @@ def generate_frames(char, approx=False, speed=None, size=None):
         yield key_frame
 
 
-def write_to_file(char, fp=None, size=None):
+def write_to_file(char, fp=None, size=None, font='standard'):
     """写入文件"""
     if not fp:
         fp = f"{char}.mp4"
@@ -445,7 +451,7 @@ def write_to_file(char, fp=None, size=None):
     video_writer = cv2.VideoWriter(fp, fourcc, 30.0, size)
     gif_writer = imageio.get_writer(f"{char}.gif", fps=30)
 
-    for key_frame in generate_frames(char, size=size):
+    for key_frame in generate_frames(char, size=size, font=font):
         video_writer.write(cv2.cvtColor(key_frame, cv2.COLOR_GRAY2BGR))
         gif_writer.append_data(cv2.cvtColor(key_frame, cv2.COLOR_BGR2RGB))
 
@@ -453,12 +459,12 @@ def write_to_file(char, fp=None, size=None):
     gif_writer.close()
 
 
-def animation(text, height=150):
+def animation(text, height=150, font='standard'):
     n = len(text)
     size = (height, height)
     key_frame = np.zeros((height, height * n), np.uint8)
     for i, char in enumerate(text):
-        for frame in generate_frames(char, approx=False, speed=None, size=size):
+        for frame in generate_frames(char, approx=False, speed=None, size=size, font=font):
             x = i * height
             y = 0
             key_frame[y:y + height, x:x + height] = frame

@@ -1,0 +1,8 @@
+imageio
+loguru
+numpy
+opencv-python
+Pillow
+requests
+scipy
+shapely
