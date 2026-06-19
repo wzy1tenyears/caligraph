@@ -1,4 +1,5 @@
 imageio
+imageio-ffmpeg
 loguru
 numpy
 opencv-python

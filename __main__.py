@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 import cv2
-import imageio
+import imageio_ffmpeg
+import numpy as np
 from loguru import logger
 
 from animation import animation
@@ -321,6 +322,28 @@ def speed_adjusted_frames(frames, speed):
             yield frame
 
 
+class StreamingGifWriter:
+    def __init__(self, path, size, fps):
+        self.writer = imageio_ffmpeg.write_frames(
+            str(path),
+            size,
+            pix_fmt_in="gray",
+            pix_fmt_out="rgb8",
+            fps=float(fps),
+            codec="gif",
+            macro_block_size=1,
+            output_params=["-loop", "0"],
+            ffmpeg_log_level="error",
+        )
+        self.writer.send(None)
+
+    def append_data(self, frame):
+        self.writer.send(np.ascontiguousarray(frame))
+
+    def close(self):
+        self.writer.close()
+
+
 def write_animation(text, mp4_path, gif_path, resolution, font, fps, speed):
     frame_size = (resolution * len(text), resolution)
     video_writer = None
@@ -334,14 +357,14 @@ def write_animation(text, mp4_path, gif_path, resolution, font, fps, speed):
                 raise RuntimeError(f"failed to open video writer: {mp4_path}")
 
         if gif_path:
-            gif_writer = imageio.get_writer(str(gif_path), fps=fps)
+            gif_writer = StreamingGifWriter(gif_path, frame_size, fps)
 
         frames = animation(text, height=resolution, font=font)
         for key_frame in speed_adjusted_frames(frames, speed):
             if video_writer:
                 video_writer.write(cv2.cvtColor(key_frame, cv2.COLOR_GRAY2BGR))
             if gif_writer:
-                gif_writer.append_data(cv2.cvtColor(key_frame, cv2.COLOR_BGR2RGB))
+                gif_writer.append_data(key_frame)
     finally:
         if video_writer:
             video_writer.release()

@@ -9,13 +9,13 @@
 import math
 import random
 import cv2
-import imageio
+import imageio_ffmpeg
 import numpy as np
 
 from scipy.spatial import distance_matrix
 
 from inscribed_circle import find_inscribed_circle_center
-from strokes import char_frames, char_strokes
+from strokes import FONT_STYLES, char_data, char_frames, char_glyph_frame, char_strokes, resolve_font
 from loguru import logger
 
 
@@ -441,6 +441,134 @@ def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
         yield key_frame
 
 
+def _median_to_canvas(point, width, height):
+    x, y = point
+    px = int(round(x / 1024 * width))
+    py = int(round((900 - y) / 1024 * height))
+    return max(0, min(width - 1, px)), max(0, min(height - 1, py))
+
+
+def _polyline_length(points):
+    total = 0.0
+    for start, end in zip(points, points[1:]):
+        total += math.hypot(end[0] - start[0], end[1] - start[1])
+    return total
+
+
+def _resample_polyline(points, spacing):
+    if len(points) < 2:
+        return points
+
+    out = [points[0]]
+    for start, end in zip(points, points[1:]):
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        steps = max(1, int(math.ceil(length / spacing)))
+        for index in range(1, steps + 1):
+            t = index / steps
+            point = (
+                int(round(start[0] + (end[0] - start[0]) * t)),
+                int(round(start[1] + (end[1] - start[1]) * t)),
+            )
+            if point != out[-1]:
+                out.append(point)
+    return out
+
+
+def _progress_indices(length, width, height):
+    if length <= 1:
+        return [0]
+    frame_count = max(5, min(28, int(round(math.sqrt(width * height) / 22))))
+    frame_count = min(frame_count, length)
+    eased = np.linspace(0, 1, frame_count) ** 0.85
+    indices = sorted({int(round(value * (length - 1))) for value in eased})
+    if indices[-1] != length - 1:
+        indices.append(length - 1)
+    return indices
+
+
+def _stroke_thickness(target_image, points, width, height):
+    binary = (target_image > 0).astype(np.uint8)
+    area = int(binary.sum())
+    length = max(1.0, _polyline_length(points))
+    estimated = area / length
+
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    radius_samples = []
+    window = max(2, int(round(min(width, height) * 0.018)))
+    for x, y in points:
+        x0, x1 = max(0, x - window), min(width, x + window + 1)
+        y0, y1 = max(0, y - window), min(height, y + window + 1)
+        if x0 < x1 and y0 < y1:
+            value = float(dist[y0:y1, x0:x1].max())
+            if value > 0:
+                radius_samples.append(value)
+
+    if radius_samples:
+        thickness = int(round(np.percentile(radius_samples, 75) * 2.8))
+    else:
+        thickness = int(round(estimated * 1.6))
+
+    lower = max(3, int(round(min(width, height) * 0.018)))
+    upper = max(lower, int(round(min(width, height) * 0.16)))
+    return max(lower, min(upper, thickness))
+
+
+def _draw_path(mask, points, end_index, thickness):
+    if not points:
+        return
+    radius = max(1, thickness // 2)
+    cv2.circle(mask, points[0], radius, 255, -1, lineType=cv2.LINE_AA)
+    for index in range(1, end_index + 1):
+        cv2.line(mask, points[index - 1], points[index], 255, thickness, lineType=cv2.LINE_AA)
+        cv2.circle(mask, points[index], radius, 255, -1, lineType=cv2.LINE_AA)
+
+
+def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
+    """Generate frames from Hanziwu stroke medians instead of contour guessing."""
+    if len(char) != 1:
+        raise ValueError('only support single character')
+    if not size:
+        W, H = 150, 150
+    else:
+        W, H = size
+
+    data = char_data(char)
+    medians = data.get('medians', [])
+    resolved_font = resolve_font(font)
+    custom_font = resolved_font not in FONT_STYLES
+    stroke_font = 'standard' if custom_font else font
+    target_frames = char_frames(char, vibe=False, font=stroke_font, size=W)[1:]
+    final_image = np.asarray(char_glyph_frame(char, font=font, size=W).point(lambda x: 255 - x), np.uint8)
+    key_frame = np.zeros((H, W), np.uint8)
+
+    for target_stroke_image, median in zip(target_frames, medians):
+        if len(median) < 2:
+            continue
+
+        target_image = np.asarray(target_stroke_image.point(lambda x: 255 - x), np.uint8)
+        points = [_median_to_canvas(point, W, H) for point in median]
+        points = _resample_polyline(points, max(1.0, min(W, H) / 180))
+        thickness = _stroke_thickness(target_image, points, W, H)
+
+        full_reveal = np.zeros((H, W), np.uint8)
+        _draw_path(full_reveal, points, len(points) - 1, int(round(thickness * 1.15)))
+        reveal_image = cv2.bitwise_and(target_image, full_reveal)
+
+        mask = np.zeros((H, W), np.uint8)
+        for index in _progress_indices(len(points), W, H):
+            _draw_path(mask, points, index, thickness)
+            frame_stroke = cv2.bitwise_and(reveal_image, mask)
+            yield cv2.bitwise_or(key_frame, frame_stroke).copy()
+
+        completed_stroke = reveal_image if custom_font else target_image
+        key_frame = cv2.bitwise_or(key_frame, completed_stroke)
+        yield key_frame.copy()
+
+    if custom_font:
+        key_frame = final_image
+        yield key_frame.copy()
+
+
 def write_to_file(char, fp=None, size=None, font='standard'):
     """写入文件"""
     if not fp:
@@ -449,11 +577,22 @@ def write_to_file(char, fp=None, size=None, font='standard'):
         size = (150, 150)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     video_writer = cv2.VideoWriter(fp, fourcc, 30.0, size)
-    gif_writer = imageio.get_writer(f"{char}.gif", fps=30)
+    gif_writer = imageio_ffmpeg.write_frames(
+        f"{char}.gif",
+        size,
+        pix_fmt_in="gray",
+        pix_fmt_out="rgb8",
+        fps=30,
+        codec="gif",
+        macro_block_size=1,
+        output_params=["-loop", "0"],
+        ffmpeg_log_level="error",
+    )
+    gif_writer.send(None)
 
     for key_frame in generate_frames(char, size=size, font=font):
         video_writer.write(cv2.cvtColor(key_frame, cv2.COLOR_GRAY2BGR))
-        gif_writer.append_data(cv2.cvtColor(key_frame, cv2.COLOR_BGR2RGB))
+        gif_writer.send(key_frame.copy(order="C"))
 
     video_writer.release()
     gif_writer.close()

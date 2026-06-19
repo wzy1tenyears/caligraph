@@ -226,7 +226,7 @@ def _render_font_glyph(char, font_path, size=150):
 
 def _custom_font_stroke(char, font_path, stroke_path, size=150):
     glyph = _render_font_glyph(char, font_path, size)
-    kernel = max(3, int(round(size * 11 / 150)))
+    kernel = max(3, min(41, int(round(size * 5 / 150))))
     if kernel % 2 == 0:
         kernel += 1
     stroke_region = _render_stroke(stroke_path, size).filter(ImageFilter.MinFilter(kernel))
@@ -251,6 +251,27 @@ def _load_hanziwu_data(char, cache):
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
         return data
+
+
+def char_data(word, cache='./cache'):
+    if not os.path.exists(cache):
+        os.makedirs(cache)
+    return _load_hanziwu_data(word, cache)
+
+
+def char_medians(word, cache='./cache'):
+    return char_data(word, cache).get('medians', [])
+
+
+def char_glyph_frame(word, cache='./cache', font='standard', size=150):
+    resolved_font = resolve_font(font)
+    if resolved_font not in FONT_STYLES:
+        return _render_font_glyph(word, resolved_font, size)
+
+    image = Image.new('L', (size, size), 255)
+    for stroke in char_frames(word, cache=cache, vibe=False, font=font, size=size)[1:]:
+        image = ImageChops.darker(image, stroke)
+    return image
 
 
 def char_frames(word, cache='./cache', vibe=True, font='standard', size=150):
