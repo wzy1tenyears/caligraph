@@ -493,6 +493,8 @@ def main():
             print(f"  {font} -> {resolved}")
         print("自定义字体文件：")
         print("  可通过 --font 传入 .ttf、.ttc 或 .otf 文件路径")
+        print("  也可把字体放在当前目录或 EXE 同目录，然后直接输入文件名，例如 --font myfont.ttf")
+        print("  省略扩展名时会自动尝试 .ttf、.ttc、.otf，例如 --font myfont")
         return
 
     logger.remove()

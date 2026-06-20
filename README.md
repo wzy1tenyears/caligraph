@@ -33,6 +33,12 @@ python __main__.py
 python __main__.py --text "\u6c38\u6c38" --font simkai --resolution 88 --fps 12 --speed 1.5 --format mp4 --color "#00ffcc" --threads 4 --cuda auto --output output.mp4
 ```
 
+自定义字体文件可以传完整路径，也可以把 `.ttf/.ttc/.otf` 放在当前目录或 EXE 同目录后直接传文件名：
+
+```powershell
+python __main__.py --text "原神" --font myfont.ttf --resolution 512 --fps 60 --output output.mp4
+```
+
 查看可用字体：
 
 ```powershell

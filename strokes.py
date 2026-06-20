@@ -2,6 +2,7 @@ import json
 import os.path
 import random
 import re
+import sys
 import urllib.parse
 
 import requests
@@ -23,6 +24,57 @@ SYSTEM_FONT_ALIASES = {
     'yahei': 'msyh.ttc',
 }
 FONT_CHOICES = FONT_STYLES + tuple(SYSTEM_FONT_ALIASES)
+FONT_FILE_EXTENSIONS = ('.ttf', '.ttc', '.otf')
+
+
+def _app_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _existing_font_file(path):
+    if os.path.isfile(path) and os.path.splitext(path)[1].lower() in FONT_FILE_EXTENSIONS:
+        return os.path.abspath(path)
+    return None
+
+
+def _font_file_names(font):
+    if os.path.splitext(font)[1]:
+        return [font]
+    return [font + extension for extension in FONT_FILE_EXTENSIONS]
+
+
+def _resolve_font_file(font, search_local_dirs=False):
+    expanded = os.path.expandvars(os.path.expanduser(font))
+    dirname = os.path.dirname(expanded)
+
+    if dirname or os.path.isabs(expanded):
+        for candidate in _font_file_names(expanded):
+            resolved = _existing_font_file(candidate)
+            if resolved:
+                return resolved
+        return None
+
+    resolved = _existing_font_file(expanded)
+    if resolved:
+        return resolved
+
+    if not search_local_dirs:
+        return None
+
+    search_dirs = []
+    for directory in (os.getcwd(), _app_dir()):
+        directory = os.path.abspath(directory)
+        if directory not in search_dirs:
+            search_dirs.append(directory)
+
+    for directory in search_dirs:
+        for filename in _font_file_names(expanded):
+            resolved = _existing_font_file(os.path.join(directory, filename))
+            if resolved:
+                return resolved
+    return None
 
 
 def _canvas_point(point, size):
@@ -173,8 +225,8 @@ def resolve_font(font):
     if font_key in FONT_STYLES:
         return font_key
 
-    font_path = os.path.expanduser(font)
-    if os.path.exists(font_path):
+    font_path = _resolve_font_file(font)
+    if font_path:
         return font_path
 
     alias = SYSTEM_FONT_ALIASES.get(font_key)
@@ -184,13 +236,17 @@ def resolve_font(font):
         if os.path.exists(alias_path):
             return alias_path
 
+    font_path = _resolve_font_file(font, search_local_dirs=True)
+    if font_path:
+        return font_path
+
     fonts_dir = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')
-    for extension in ('*.ttf', '*.ttc', '*.otf'):
+    for extension in FONT_FILE_EXTENSIONS:
         pattern = re.compile(r'.*', re.IGNORECASE)
         if not os.path.isdir(fonts_dir):
             break
         for filename in os.listdir(fonts_dir):
-            if not filename.lower().endswith(extension[1:]):
+            if not filename.lower().endswith(extension):
                 continue
             stem = os.path.splitext(filename)[0].lower()
             if stem == font_key:
@@ -200,7 +256,7 @@ def resolve_font(font):
 
     raise ValueError(
         f"unsupported font: {font}. Use --list-fonts to see built-in names, "
-        "or pass a .ttf/.ttc/.otf file path."
+        "or pass a .ttf/.ttc/.otf file path/name."
     )
 
 
