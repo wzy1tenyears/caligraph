@@ -15,6 +15,17 @@ from strokes import FONT_CHOICES, FONT_STYLES, SYSTEM_FONT_ALIASES, resolve_font
 
 
 CODEPOINT_RE = re.compile(r'^(?:U\+|0x)?([0-9a-fA-F]{4,6})$')
+COLOR_NAMES = {
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "orange": (255, 165, 0),
+}
 
 
 class ChineseArgumentParser(argparse.ArgumentParser):
@@ -56,6 +67,16 @@ def positive_int(value):
     return number
 
 
+def nonnegative_int(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value} 不是整数") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("数值必须大于或等于 0")
+    return number
+
+
 def positive_float(value):
     try:
         number = float(value)
@@ -64,6 +85,32 @@ def positive_float(value):
     if number <= 0:
         raise argparse.ArgumentTypeError("数值必须大于 0")
     return number
+
+
+def parse_color(value):
+    if not value:
+        return COLOR_NAMES["white"]
+
+    text = value.strip().lower()
+    if text in COLOR_NAMES:
+        return COLOR_NAMES[text]
+
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3 and all(ch in "0123456789abcdef" for ch in text):
+        text = "".join(ch * 2 for ch in text)
+    if len(text) == 6 and all(ch in "0123456789abcdef" for ch in text):
+        return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
+
+    raise argparse.ArgumentTypeError("颜色必须是 #RRGGBB、RRGGBB、#RGB 或 red/green/blue 等颜色名")
+
+
+def colorize_frame(frame, color):
+    rgb = np.zeros((*frame.shape, 3), np.uint8)
+    for channel, value in enumerate(color):
+        if value:
+            rgb[:, :, channel] = np.asarray(frame.astype(np.uint16) * value // 255, np.uint8)
+    return rgb
 
 
 def build_parser():
@@ -133,6 +180,27 @@ def build_parser():
         default=1.0,
         metavar="倍速",
         help="动画速度倍数。2 表示两倍速，0.5 表示半速。默认：1。",
+    )
+    parser.add_argument(
+        "--threads",
+        type=nonnegative_int,
+        default=0,
+        metavar="线程数",
+        help="线程数，0 表示自动。",
+    )
+    parser.add_argument(
+        "--cuda",
+        choices=("auto", "on", "off"),
+        default="auto",
+        metavar="模式",
+        help="CUDA 加速：auto 自动检测，on 强制启用，off 关闭。",
+    )
+    parser.add_argument(
+        "--color",
+        type=parse_color,
+        default=COLOR_NAMES["white"],
+        metavar="颜色",
+        help="笔画颜色，支持 #RRGGBB、#RGB 或 red/green/blue 等颜色名。默认：white。",
     )
     parser.add_argument(
         "--list-fonts",
@@ -269,6 +337,20 @@ def prompt_interactive(args):
 
     args.fps = prompt_positive_int("帧率 FPS", args.fps)
     args.speed = prompt_positive_float("动画速度倍数", args.speed)
+    args.threads = prompt_positive_int("线程数（0 表示自动）", args.threads)
+    args.cuda = prompt_choice(
+        "CUDA 加速模式：",
+        [("自动检测", "auto"), ("强制启用", "on"), ("关闭", "off")],
+        args.cuda,
+        allow_custom=False,
+    )
+    while True:
+        color_answer = input("笔画颜色（#RRGGBB / red / green / blue）[white]: ").strip()
+        try:
+            args.color = parse_color(color_answer or "white")
+            break
+        except argparse.ArgumentTypeError as exc:
+            print(exc)
     args.format = prompt_choice(
         "输出格式：",
         [("MP4 视频", "mp4"), ("GIF 动图", "gif"), ("同时输出 MP4 和 GIF", "both")],
@@ -323,16 +405,19 @@ def speed_adjusted_frames(frames, speed):
 
 
 class StreamingGifWriter:
-    def __init__(self, path, size, fps):
+    def __init__(self, path, size, fps, threads=0):
+        output_params = ["-loop", "0"]
+        if threads:
+            output_params.extend(["-threads", str(threads)])
         self.writer = imageio_ffmpeg.write_frames(
             str(path),
             size,
-            pix_fmt_in="gray",
+            pix_fmt_in="rgb24",
             pix_fmt_out="rgb8",
             fps=float(fps),
             codec="gif",
             macro_block_size=1,
-            output_params=["-loop", "0"],
+            output_params=output_params,
             ffmpeg_log_level="error",
         )
         self.writer.send(None)
@@ -344,7 +429,24 @@ class StreamingGifWriter:
         self.writer.close()
 
 
-def write_animation(text, mp4_path, gif_path, resolution, font, fps, speed):
+def detect_cuda():
+    try:
+        return hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except cv2.error:
+        return False
+
+
+def configure_runtime(threads, cuda_mode):
+    if threads:
+        cv2.setNumThreads(threads)
+
+    cuda_available = detect_cuda()
+    if cuda_mode == "on" and not cuda_available:
+        raise RuntimeError("CUDA 不可用：当前 OpenCV 没有检测到 CUDA 设备或 CUDA 支持")
+    return cuda_mode != "off" and cuda_available
+
+
+def write_animation(text, mp4_path, gif_path, resolution, font, fps, speed, threads=0, use_cuda=False, color=COLOR_NAMES["white"]):
     frame_size = (resolution * len(text), resolution)
     video_writer = None
     gif_writer = None
@@ -357,14 +459,15 @@ def write_animation(text, mp4_path, gif_path, resolution, font, fps, speed):
                 raise RuntimeError(f"failed to open video writer: {mp4_path}")
 
         if gif_path:
-            gif_writer = StreamingGifWriter(gif_path, frame_size, fps)
+            gif_writer = StreamingGifWriter(gif_path, frame_size, fps, threads=threads)
 
-        frames = animation(text, height=resolution, font=font)
+        frames = animation(text, height=resolution, font=font, use_cuda=use_cuda)
         for key_frame in speed_adjusted_frames(frames, speed):
+            color_frame = colorize_frame(key_frame, color)
             if video_writer:
-                video_writer.write(cv2.cvtColor(key_frame, cv2.COLOR_GRAY2BGR))
+                video_writer.write(cv2.cvtColor(color_frame, cv2.COLOR_RGB2BGR))
             if gif_writer:
-                gif_writer.append_data(key_frame)
+                gif_writer.append_data(color_frame)
     finally:
         if video_writer:
             video_writer.release()
@@ -417,7 +520,26 @@ def main():
     print(f"速度：{args.speed}x")
     print("正在生成...")
 
-    write_animation(text, mp4_path, gif_path, args.resolution, args.font, args.fps, args.speed)
+    try:
+        use_cuda = configure_runtime(args.threads, args.cuda)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    print(f"线程：{args.threads if args.threads else '自动'}")
+    print(f"CUDA：{'已启用' if use_cuda else 'CPU'}")
+    print(f"颜色：#{args.color[0]:02X}{args.color[1]:02X}{args.color[2]:02X}")
+
+    write_animation(
+        text,
+        mp4_path,
+        gif_path,
+        args.resolution,
+        args.font,
+        args.fps,
+        args.speed,
+        threads=args.threads,
+        use_cuda=use_cuda,
+        color=args.color,
+    )
 
     if mp4_path:
         print(f"MP4：{mp4_path}")

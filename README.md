@@ -30,7 +30,7 @@ python __main__.py
 命令行模式：
 
 ```powershell
-python __main__.py --text "\u6c38\u6c38" --font simkai --resolution 88 --fps 12 --speed 1.5 --format mp4 --output output.mp4
+python __main__.py --text "\u6c38\u6c38" --font simkai --resolution 88 --fps 12 --speed 1.5 --format mp4 --color "#00ffcc" --threads 4 --cuda auto --output output.mp4
 ```
 
 查看可用字体：
@@ -44,7 +44,7 @@ python __main__.py --list-fonts
 目录版 EXE：
 
 ```powershell
-.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --noupx --onedir --name caligraph --copy-metadata imageio __main__.py
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --noupx --onedir --name caligraph --copy-metadata imageio --copy-metadata imageio-ffmpeg __main__.py
 ```
 
 产物位于：

@@ -575,18 +575,59 @@ def _stroke_progress_frame(target_image, coords, progress, total, progress_ratio
     return out
 
 
-def _generate_custom_font_frames(char, medians, size, font):
+def _bitwise_and(left, right, use_cuda=False):
+    if not use_cuda:
+        return cv2.bitwise_and(left, right)
+    try:
+        left_gpu = cv2.cuda_GpuMat()
+        right_gpu = cv2.cuda_GpuMat()
+        left_gpu.upload(left)
+        right_gpu.upload(right)
+        return cv2.cuda.bitwise_and(left_gpu, right_gpu).download()
+    except (AttributeError, cv2.error):
+        return cv2.bitwise_and(left, right)
+
+
+def _bitwise_or(left, right, use_cuda=False):
+    if not use_cuda:
+        return cv2.bitwise_or(left, right)
+    try:
+        left_gpu = cv2.cuda_GpuMat()
+        right_gpu = cv2.cuda_GpuMat()
+        left_gpu.upload(left)
+        right_gpu.upload(right)
+        return cv2.cuda.bitwise_or(left_gpu, right_gpu).download()
+    except (AttributeError, cv2.error):
+        return cv2.bitwise_or(left, right)
+
+
+def _generate_custom_font_frames(char, medians, size, font, use_cuda=False):
     W, H = size
     final_image = np.asarray(char_glyph_frame(char, font=font, size=W).point(lambda x: 255 - x), np.uint8)
-    frame_count = max(18, min(240, 12 * max(1, len(medians))))
-    for step in range(1, frame_count + 1):
-        progress = step / frame_count
-        eased = 1 - (1 - progress) ** 2
-        yield np.asarray(final_image.astype(np.float32) * eased, np.uint8)
+    target_frames = char_frames(char, vibe=False, font='standard', size=W)[1:]
+    key_frame = np.zeros((H, W), np.uint8)
+
+    for target_stroke_image, median in zip(target_frames, medians):
+        if len(median) < 2:
+            continue
+
+        target_image = np.asarray(target_stroke_image.point(lambda x: 255 - x), np.uint8)
+        points = [_median_to_canvas(point, W, H) for point in median]
+        points = _resample_polyline(points, max(1.0, min(W, H) / 180))
+        coords, progress_values, total_progress = _stroke_progress_data(target_image, points)
+
+        for index in _progress_indices(len(points), W, H):
+            progress = index / max(1, len(points) - 1)
+            frame_stroke = _stroke_progress_frame(target_image, coords, progress_values, total_progress, progress)
+            yield _bitwise_or(key_frame, frame_stroke, use_cuda).copy()
+
+        key_frame = _bitwise_or(key_frame, target_image, use_cuda)
+        yield key_frame.copy()
+
     yield final_image.copy()
 
 
-def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
+def generate_frames(char, approx=False, speed=None, size=None, font='standard', use_cuda=False):
     """Generate frames from Hanziwu stroke medians instead of contour guessing."""
     if len(char) != 1:
         raise ValueError('only support single character')
@@ -599,7 +640,7 @@ def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
     medians = data.get('medians', [])
     resolved_font = resolve_font(font)
     if resolved_font not in FONT_STYLES:
-        yield from _generate_custom_font_frames(char, medians, (W, H), font)
+        yield from _generate_custom_font_frames(char, medians, (W, H), font, use_cuda=use_cuda)
         return
 
     target_frames = char_frames(char, vibe=False, font=font, size=W)[1:]
@@ -617,9 +658,9 @@ def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
         for index in _progress_indices(len(points), W, H):
             progress = index / max(1, len(points) - 1)
             frame_stroke = _stroke_progress_frame(target_image, coords, progress_values, total_progress, progress)
-            yield cv2.bitwise_or(key_frame, frame_stroke).copy()
+            yield _bitwise_or(key_frame, frame_stroke, use_cuda).copy()
 
-        key_frame = cv2.bitwise_or(key_frame, target_image)
+        key_frame = _bitwise_or(key_frame, target_image, use_cuda)
         yield key_frame.copy()
 
 
@@ -652,12 +693,12 @@ def write_to_file(char, fp=None, size=None, font='standard'):
     gif_writer.close()
 
 
-def animation(text, height=150, font='standard'):
+def animation(text, height=150, font='standard', use_cuda=False):
     n = len(text)
     size = (height, height)
     key_frame = np.zeros((height, height * n), np.uint8)
     for i, char in enumerate(text):
-        for frame in generate_frames(char, approx=False, speed=None, size=size, font=font):
+        for frame in generate_frames(char, approx=False, speed=None, size=size, font=font, use_cuda=use_cuda):
             x = i * height
             y = 0
             key_frame[y:y + height, x:x + height] = frame
