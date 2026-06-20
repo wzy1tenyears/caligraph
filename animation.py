@@ -523,6 +523,69 @@ def _draw_path(mask, points, end_index, thickness):
         cv2.circle(mask, points[index], radius, 255, -1, lineType=cv2.LINE_AA)
 
 
+def _stroke_progress_data(target_image, points):
+    binary = target_image > 0
+    coords = np.column_stack(np.nonzero(binary))
+    if len(coords) == 0:
+        return coords, np.zeros(0, np.float32), 0.0
+
+    y = coords[:, 0].astype(np.float32)
+    x = coords[:, 1].astype(np.float32)
+    best_distance = np.full(len(coords), np.inf, np.float32)
+    best_progress = np.zeros(len(coords), np.float32)
+
+    total = 0.0
+    segments = []
+    for start, end in zip(points, points[1:]):
+        length = math.hypot(end[0] - start[0], end[1] - start[1])
+        if length > 0:
+            segments.append((start, end, total, length))
+            total += length
+    if total <= 0:
+        return coords, np.zeros(len(coords), np.float32), 0.0
+
+    for start, end, offset, length in segments:
+        sx, sy = start
+        ex, ey = end
+        dx = ex - sx
+        dy = ey - sy
+        denom = dx * dx + dy * dy
+        t = np.clip(((x - sx) * dx + (y - sy) * dy) / denom, 0, 1)
+        nearest_x = sx + t * dx
+        nearest_y = sy + t * dy
+        distance = (x - nearest_x) ** 2 + (y - nearest_y) ** 2
+        closer = distance < best_distance
+        best_distance[closer] = distance[closer]
+        best_progress[closer] = offset + t[closer] * length
+
+    return coords, best_progress, total
+
+
+def _stroke_progress_frame(target_image, coords, progress, total, progress_ratio):
+    out = np.zeros_like(target_image)
+    if len(coords) == 0:
+        return out
+    if total <= 0:
+        out[coords[:, 0], coords[:, 1]] = target_image[coords[:, 0], coords[:, 1]]
+        return out
+
+    threshold = max(0.0, min(1.0, progress_ratio)) * total
+    selected = progress <= threshold
+    out[coords[selected, 0], coords[selected, 1]] = target_image[coords[selected, 0], coords[selected, 1]]
+    return out
+
+
+def _generate_custom_font_frames(char, medians, size, font):
+    W, H = size
+    final_image = np.asarray(char_glyph_frame(char, font=font, size=W).point(lambda x: 255 - x), np.uint8)
+    frame_count = max(18, min(240, 12 * max(1, len(medians))))
+    for step in range(1, frame_count + 1):
+        progress = step / frame_count
+        eased = 1 - (1 - progress) ** 2
+        yield np.asarray(final_image.astype(np.float32) * eased, np.uint8)
+    yield final_image.copy()
+
+
 def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
     """Generate frames from Hanziwu stroke medians instead of contour guessing."""
     if len(char) != 1:
@@ -535,10 +598,11 @@ def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
     data = char_data(char)
     medians = data.get('medians', [])
     resolved_font = resolve_font(font)
-    custom_font = resolved_font not in FONT_STYLES
-    stroke_font = 'standard' if custom_font else font
-    target_frames = char_frames(char, vibe=False, font=stroke_font, size=W)[1:]
-    final_image = np.asarray(char_glyph_frame(char, font=font, size=W).point(lambda x: 255 - x), np.uint8)
+    if resolved_font not in FONT_STYLES:
+        yield from _generate_custom_font_frames(char, medians, (W, H), font)
+        return
+
+    target_frames = char_frames(char, vibe=False, font=font, size=W)[1:]
     key_frame = np.zeros((H, W), np.uint8)
 
     for target_stroke_image, median in zip(target_frames, medians):
@@ -548,24 +612,14 @@ def generate_frames(char, approx=False, speed=None, size=None, font='standard'):
         target_image = np.asarray(target_stroke_image.point(lambda x: 255 - x), np.uint8)
         points = [_median_to_canvas(point, W, H) for point in median]
         points = _resample_polyline(points, max(1.0, min(W, H) / 180))
-        thickness = _stroke_thickness(target_image, points, W, H)
+        coords, progress_values, total_progress = _stroke_progress_data(target_image, points)
 
-        full_reveal = np.zeros((H, W), np.uint8)
-        _draw_path(full_reveal, points, len(points) - 1, int(round(thickness * 1.15)))
-        reveal_image = cv2.bitwise_and(target_image, full_reveal)
-
-        mask = np.zeros((H, W), np.uint8)
         for index in _progress_indices(len(points), W, H):
-            _draw_path(mask, points, index, thickness)
-            frame_stroke = cv2.bitwise_and(reveal_image, mask)
+            progress = index / max(1, len(points) - 1)
+            frame_stroke = _stroke_progress_frame(target_image, coords, progress_values, total_progress, progress)
             yield cv2.bitwise_or(key_frame, frame_stroke).copy()
 
-        completed_stroke = reveal_image if custom_font else target_image
-        key_frame = cv2.bitwise_or(key_frame, completed_stroke)
-        yield key_frame.copy()
-
-    if custom_font:
-        key_frame = final_image
+        key_frame = cv2.bitwise_or(key_frame, target_image)
         yield key_frame.copy()
 
 
